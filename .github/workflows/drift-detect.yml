@@ -1,0 +1,96 @@
+name: appsec-drift-detect
+
+# ACC 側の out-of-band 変更を検知し、差分があれば取り込み PR を立てる。
+# 検知は二段: (1) 再 export と commit 済み baseline の diff（版の内容）
+#            (2) config レベルのオブジェクト一覧（custom rules / rate policies）の diff
+# detect.py の exit: 0=clean / 2=drift / それ以外=異常（緑にせず赤で落とす）。
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read      # checkout のみ（baseline 更新は人が判断＝自動 push しない）
+  issues: write       # ドリフトを Issue で通知
+
+concurrency:
+  group: appsec-drift-detect
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    env:
+      CONFIG_NAME: ${{ vars.APPSEC_CONFIG_NAME }}
+      CONFIG_ID: ${{ vars.APPSEC_CONFIG_ID }}
+      AKAMAI_SECTION: default
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Akamai CLI + plugins (.edgerc from secret)
+        env:
+          EDGERC: ${{ secrets.EDGERC }}       # run 本文へ直接展開しない（インジェクション回避）
+        run: |
+          set -euo pipefail
+          umask 077                            # 生成時点から 600
+          printf '%s' "$EDGERC" > "$HOME/.edgerc"
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/akamai" \
+            https://github.com/akamai/cli/releases/download/v2.0.5/akamai-v2.0.5-linuxamd64
+          chmod +x "$HOME/.local/bin/akamai"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          akamai --version
+          akamai install appsec terraform
+          akamai appsec --version
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Detect drift
+        id: detect
+        run: |
+          set +e
+          # パイプを使わず python の exit code を直接取る（shell 差で pipefail が外れても安全）
+          python3 lib/detect.py \
+            --baseline baseline \
+            --baseline-objs baseline/objects.json \
+            --config-name "$CONFIG_NAME" \
+            --config-id "$CONFIG_ID" \
+            --section "$AKAMAI_SECTION" \
+            --json-out /tmp/report.json > /tmp/report.txt 2>&1
+          code=$?
+          cat /tmp/report.txt
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|10) : ;;                         # 既知の正常コード（0=clean, 10=drift）のみ通す
+            *) echo "::error::detect.py 異常終了 code=$code（監視が死んでいる可能性）"; exit "$code" ;;
+          esac
+
+      - name: No drift
+        if: steps.detect.outputs.code == '0'
+        run: echo "drift なし。何もしない。"
+
+      - name: Open drift Issue
+        if: steps.detect.outputs.code == '10'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 既に open な drift Issue があればスキップ（毎時の重複を防ぐ）
+          count="$(gh issue list -R "$REPO" --state open --label drift --json number --jq 'length' 2>/dev/null || echo 0)"
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "既存の open な drift Issue があるためスキップ。"; exit 0
+          fi
+          # 差分＋取り込み用 Terraform を Issue 本文に生成（config 名は env 経由＝インジェクション回避）
+          python3 - > /tmp/issue.md <<'PY'
+          import json, os, sys
+          sys.path.insert(0, "lib"); import adopt
+          rep = json.load(open("/tmp/report.json"))
+          print(adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", "")))
+          PY
+          gh label create drift -R "$REPO" --color FBCA04 --description "AppSec drift 検知" 2>/dev/null || true
+          gh issue create -R "$REPO" --title "AppSec ドリフト検知" --label drift --body-file /tmp/issue.md

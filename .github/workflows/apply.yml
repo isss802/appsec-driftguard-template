@@ -1,0 +1,128 @@
+name: appsec-apply
+
+# main への merge で apply。staging 自動、production は Environment 承認必須。
+#
+# drift-gate の基準 version は「承認/審査の前」に gate ジョブで確定して持ち回る。
+# こうしないと、production の承認待ち中に起きた out-of-band 変更を、承認直後に読んだ
+# live 値がそのまま基準になって素通りする（承認の窓 = ゲートが守るべき窓を自分で無視する）。
+# 注: 最も正確な基準は Terraform state が「最後に反映した」と記録する version。ここでは
+#     pipeline 開始時の live 値を基準にし、承認〜apply の窓のドリフトを止める（開始前から
+#     存在するドリフトは drift-detect ワークフローが毎時拾って PR にする、で二段で塞ぐ）。
+
+# 安全のため当面は手動起動のみ。terraform 構成一式・Environments（staging/production の
+# 承認者）・akamai CLI 導入を整え、本番反映の決裁が済んでから push トリガを有効化する。
+#   on:
+#     push:
+#       branches: [main]
+on:
+  workflow_dispatch:
+    inputs:
+      target_staging_version:
+        description: "activate する staging 版（terraform apply が作った版）"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appsec-apply          # apply の並走による state ロック競合を防ぐ
+  cancel-in-progress: false
+
+env:
+  CONFIG_NAME: ${{ vars.APPSEC_CONFIG_NAME }}
+  CONFIG_ID: ${{ vars.APPSEC_CONFIG_ID }}
+  AKAMAI_SECTION: default
+
+jobs:
+  # 承認より前に基準 version を確定する（environment を付けない = 承認ブロックの前に走る）
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      staging: ${{ steps.b.outputs.staging }}
+      prod: ${{ steps.b.outputs.prod }}
+    steps:
+      - name: Set up Akamai CLI
+        env:
+          EDGERC: ${{ secrets.EDGERC }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$EDGERC" > "$HOME/.edgerc"
+      - id: b
+        run: |
+          set -euo pipefail
+          json="$(akamai appsec configs --section "$AKAMAI_SECTION" --json)"
+          # 再帰降下 .. をやめ単一パス＋数値検証（複数マッチ/null/改行混入を防ぐ）
+          s="$(jq -er --arg n "$CONFIG_NAME" 'first(.configurations[]? | select(.name==$n)) | .stagingVersion // empty' <<<"$json")"
+          p="$(jq -er --arg n "$CONFIG_NAME" 'first(.configurations[]? | select(.name==$n)) | .productionVersion // empty' <<<"$json")"
+          [[ "$s" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] || { echo "::error::版取得失敗 s=$s p=$p"; exit 1; }
+          echo "staging=$s" >> "$GITHUB_OUTPUT"
+          echo "prod=$p" >> "$GITHUB_OUTPUT"
+
+  staging:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Akamai CLI
+        env:
+          EDGERC: ${{ secrets.EDGERC }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$EDGERC" > "$HOME/.edgerc"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+      - name: terraform apply (staging)
+        env:
+          EXPECTED_STAGING: ${{ needs.gate.outputs.staging }}
+          TARGET_STAGING: ${{ github.event.inputs.target_staging_version }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_STAGING" =~ ^[0-9]+$ ]] || { echo "::error::版不正 $EXPECTED_STAGING"; exit 1; }
+          args=(-auto-approve -input=false -var "expected_staging_version=$EXPECTED_STAGING")
+          if [[ -n "${TARGET_STAGING:-}" ]]; then
+            [[ "$TARGET_STAGING" =~ ^[0-9]+$ ]] || { echo "::error::target 不正 $TARGET_STAGING"; exit 1; }
+            args+=(-var "target_staging_version=$TARGET_STAGING")
+          fi
+          terraform init -input=false
+          terraform apply "${args[@]}"
+
+  production:
+    needs: [gate, staging]
+    runs-on: ubuntu-latest
+    environment: production        # ← required reviewers を付ける（人間承認ゲート）
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Akamai CLI
+        env:
+          EDGERC: ${{ secrets.EDGERC }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$EDGERC" > "$HOME/.edgerc"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+      - name: terraform plan (production, gate + save plan)
+        id: plan
+        env:
+          EXPECTED_PROD: ${{ needs.gate.outputs.prod }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_PROD" =~ ^[0-9]+$ ]] || { echo "::error::版不正 $EXPECTED_PROD"; exit 1; }
+          terraform init -input=false
+          set +e
+          terraform plan -input=false -detailed-exitcode -out=prod.tfplan \
+            -var "expected_prod_version=$EXPECTED_PROD"
+          rc=$?; set -e
+          case "$rc" in
+            0) echo "変更なし。apply スキップ。"; echo "changes=0" >> "$GITHUB_OUTPUT" ;;
+            2) echo "適用すべき変更あり。"; echo "changes=1" >> "$GITHUB_OUTPUT" ;;   # exit2 は正常。落とさない
+            *) echo "::error::plan 失敗 / precondition 違反 rc=$rc"; exit 1 ;;         # exit1 のみブロック
+          esac
+      - name: terraform apply (production)
+        if: steps.plan.outputs.changes == '1'
+        run: terraform apply -input=false prod.tfplan   # 審査した plan をそのまま適用

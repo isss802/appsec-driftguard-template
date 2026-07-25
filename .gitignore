@@ -1,0 +1,12 @@
+# テスト生成物（実 config の export を含む＝コミットしない）
+tests/live_baseline/
+tests/live_baseline_objs.json
+# terraform 作業物
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+prod.tfplan
+__pycache__/
+.pytest_cache/
+*.pyc
