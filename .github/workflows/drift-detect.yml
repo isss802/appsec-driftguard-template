@@ -1,9 +1,9 @@
 name: appsec-drift-detect
 
-# ACC 側の out-of-band 変更を検知し、差分があれば取り込み PR を立てる。
+# ACC 側の out-of-band 変更を検知し、差分があれば取り込み方法つきの Issue を立てる。
 # 検知は二段: (1) 再 export と commit 済み baseline の diff（版の内容）
 #            (2) config レベルのオブジェクト一覧（custom rules / rate policies）の diff
-# detect.py の exit: 0=clean / 2=drift / それ以外=異常（緑にせず赤で落とす）。
+# detect.py の exit: 0=clean / 10=drift / それ以外=異常（緑にせず赤で落とす）。
 
 on:
   schedule:

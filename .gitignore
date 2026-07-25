@@ -10,3 +10,6 @@ prod.tfplan
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# 実 config の baseline は公開テンプレに含めない（private デプロイ側で -f して commit）
+baseline/
