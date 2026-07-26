@@ -6,8 +6,6 @@ name: appsec-drift-detect
 # detect.py の exit: 0=clean / 10=drift / それ以外=異常（緑にせず赤で落とす）。
 
 on:
-  schedule:
-    - cron: "17 * * * *"
   workflow_dispatch: {}
 
 permissions:
