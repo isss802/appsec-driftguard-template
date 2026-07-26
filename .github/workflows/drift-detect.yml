@@ -28,21 +28,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Akamai CLI + plugins (.edgerc from secret)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"                   # cli-appsec が要求する Node（cli.json: 22.0.0）
+
+      - name: Set up Akamai CLI + pinned plugins (.edgerc from secret)
         env:
           EDGERC: ${{ secrets.EDGERC }}       # run 本文へ直接展開しない（インジェクション回避）
         run: |
           set -euo pipefail
           umask 077                            # 生成時点から 600
           printf '%s' "$EDGERC" > "$HOME/.edgerc"
-          mkdir -p "$HOME/.local/bin"
+          # --- 版はすべて固定する。latest 追従だと export 出力が変わって
+          #     baseline と食い違い、偽ドリフトや検知破綻を招くため。バンプ時はここを変える。
+          CLI_VER=2.0.5                        # akamai CLI 本体
+          TF_PLUGIN_VER=2.11.0                 # cli-terraform（export-appsec を生成する側）
+          APPSEC_PLUGIN_VER=3.3.1              # cli-appsec（custom-rules / rate-policies を取得する側）
+          SRC="$HOME/.akamai-cli/src"
+          mkdir -p "$HOME/.local/bin" "$SRC"
+          # CLI 本体（リリースバイナリを直接取得）
           curl -fsSL -o "$HOME/.local/bin/akamai" \
-            https://github.com/akamai/cli/releases/download/v2.0.5/akamai-v2.0.5-linuxamd64
+            "https://github.com/akamai/cli/releases/download/v${CLI_VER}/akamai-v${CLI_VER}-linuxamd64"
           chmod +x "$HOME/.local/bin/akamai"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
           akamai --version
-          akamai install appsec terraform
+          # プラグインは akamai install（＝常に最新）を使わず、特定タグを clone して固定する。
+          # cli-terraform: 版に対応するバイナリを bin/ に直接配置（install 時の自動取得に頼らない）。
+          git clone --depth 1 --branch "v${TF_PLUGIN_VER}" \
+            https://github.com/akamai/cli-terraform "$SRC/cli-terraform"
+          mkdir -p "$SRC/cli-terraform/bin"
+          curl -fsSL -o "$SRC/cli-terraform/bin/akamai-terraform" \
+            "https://github.com/akamai/cli-terraform/releases/download/v${TF_PLUGIN_VER}/akamai-terraform-${TF_PLUGIN_VER}-linuxamd64"
+          chmod +x "$SRC/cli-terraform/bin/akamai-terraform"
+          # cli-appsec: Node 製。clone 後に本番依存だけ導入する。
+          git clone --depth 1 --branch "$APPSEC_PLUGIN_VER" \
+            https://github.com/akamai/cli-appsec "$SRC/cli-appsec"
+          ( cd "$SRC/cli-appsec" && npm ci --omit=dev )
+          akamai terraform --version
           akamai appsec --version
 
       - uses: hashicorp/setup-terraform@v3

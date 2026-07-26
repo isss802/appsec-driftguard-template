@@ -58,7 +58,9 @@ baseline と比べます。
 ## 前提
 
 - **Akamai CLI**（本体）＋プラグイン `appsec` / `terraform`
-  （`akamai install appsec terraform` で導入。検知ワークフローは CI 内で自動導入します）
+  （検知ワークフローは CI 内で自動導入します。**CLI 本体・プラグイン・Terraform はすべて版を固定**しています。
+  プラグインを `akamai install`（＝常に最新）任せにすると export 出力が変わって baseline と食い違い、
+  偽ドリフトを招くため。版は `drift-detect.yml` の `CLI_VER` / `TF_PLUGIN_VER` / `APPSEC_PLUGIN_VER` で管理します）
 - **Terraform**（`terraform fmt` / 反映で使用）
 - **Python 3**
 - **`.edgerc`** に `[default]` セクション（このテンプレートは section=`default` を前提。
