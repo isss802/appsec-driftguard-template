@@ -7,7 +7,7 @@ name: appsec-apply
 # live 値がそのまま基準になって素通りする（承認の窓 = ゲートが守るべき窓を自分で無視する）。
 # 注: 最も正確な基準は Terraform state が「最後に反映した」と記録する version。ここでは
 #     pipeline 開始時の live 値を基準にし、承認〜apply の窓のドリフトを止める（開始前から
-#     存在するドリフトは drift-detect ワークフローが毎時拾って PR にする、で二段で塞ぐ）。
+#     存在するドリフトは drift-detect ワークフローが拾って Issue にする、で二段で塞ぐ）。
 
 # 安全のため当面は手動起動のみ。terraform 構成一式・Environments（staging/production の
 # 承認者）・akamai CLI 導入を整え、本番反映の決裁が済んでから push トリガを有効化する。
