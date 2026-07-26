@@ -230,6 +230,30 @@ class TestAdversarialContent(unittest.TestCase):
         self.assertIn(r"a\u0008b", hcl)
         self.assertIn(r"a\u000cc", hcl)
 
+    def test_fingerprint_ignores_volatile_keys(self):
+        """表示内容が同じなら指紋も同じ。
+
+        report 全体を hash していたときは、ドリフト判定では無視する揮発キー
+        （version / updateDate / used 等）が変わるだけで指紋が変わり、同じ内容の
+        コメントが毎時増えていた。"""
+        r1 = _report(added_cr=dict(RULE))
+        r2 = _report(added_cr=dict(RULE, version=99, updateDate="2027", used=True))
+        b1 = adopt.render_issue(r1, config_name="c", config_id="12345")
+        b2 = adopt.render_issue(r2, config_name="c", config_id="12345")
+        self.assertEqual(b1, b2)                       # 本文は同一
+        self.assertEqual(adopt.body_fingerprint(b1),
+                         adopt.body_fingerprint(b2))   # 指紋も同一であるべき
+
+    def test_fingerprint_changes_when_body_changes(self):
+        b1 = adopt.render_issue(_report(added_cr=RULE), config_id="12345")
+        b2 = adopt.render_issue(_report(added_cr=dict(RULE, name="OTHER")), config_id="12345")
+        self.assertNotEqual(b1, b2)
+        self.assertNotEqual(adopt.body_fingerprint(b1), adopt.body_fingerprint(b2))
+
+    def test_fp_marker_is_html_comment(self):
+        fp = adopt.body_fingerprint("x")
+        self.assertEqual(adopt.fp_marker(fp), f"<!-- dg-fp:{fp} -->")
+
     def test_oid_is_sanitized_in_local_name(self):
         """id 側も正規化する。name だけ正規化していると、id 経由で HCL を脱出できる。
 

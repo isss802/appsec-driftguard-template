@@ -1,8 +1,9 @@
 name: appsec-drift-detect
 
 # ACC 側の out-of-band 変更を検知し、差分があれば取り込み方法つきの Issue を立てる。
-# 検知は二段: (1) 再 export と commit 済み baseline の diff（版の内容）
-#            (2) config レベルのオブジェクト一覧（custom rules / rate policies）の diff
+# 検知は三段: (1) 再 export と commit 済み baseline の diff（版の内容・export root 全体）
+#            (2) staging / production に載っている版番号の diff（ロールバック検知）
+#            (3) config レベルのオブジェクト一覧（custom rules / rate policies）の diff
 # detect.py の exit: 0=clean / 10=drift / それ以外=異常（緑にせず赤で落とす）。
 
 on:
@@ -112,15 +113,17 @@ jobs:
           set -euo pipefail
           # 差分＋取り込み用 Terraform を本文に生成（config 名は env 経由＝インジェクション回避）。
           # 末尾に内容の指紋をコメントとして埋め、次回が「既に通知済みか」を判定できるようにする。
-          python3 - > /tmp/issue.md <<'PY'
+          python3 - <<'PY'
           import json, os, sys
           sys.path.insert(0, "lib"); import adopt
           rep = json.load(open("/tmp/report.json"))
-          print(adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", ""), config_id=os.environ.get("CONFIG_ID")))
-          print()
-          print(adopt.fp_marker(rep))
+          body = adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", ""),
+                                    config_id=os.environ.get("CONFIG_ID"))
+          fp = adopt.body_fingerprint(body)
+          open("/tmp/issue.md", "w").write(body + "\n\n" + adopt.fp_marker(fp) + "\n")
+          open("/tmp/issue.fp", "w").write(fp)
           PY
-          fp="$(python3 -c 'import json,sys; sys.path.insert(0,"lib"); import adopt; print(adopt.fingerprint(json.load(open("/tmp/report.json"))))')"
+          fp="$(cat /tmp/issue.fp)"
           num="$(gh issue list -R "$REPO" --state open --label drift --json number --jq '.[0].number // empty')"
           if [ -z "$num" ]; then
             gh label create drift -R "$REPO" --color FBCA04 --description "AppSec drift 検知" 2>/dev/null || true
@@ -130,8 +133,12 @@ jobs:
           # open な Issue がある。重複 Issue は作らないが、黙って何もしないと
           # 「対応中に入った別の変更」が通知されない窓ができる。しかもその窓は、
           # 無害なドリフトを1つ起こすだけで意図的に開けられる。内容が変われば追記する。
-          if gh issue view "$num" -R "$REPO" --json body,comments \
-               --jq '[.body] + [.comments[].body] | join("\n")' | grep -qF "$fp"; then
+          # パイプにしない: grep -q は一致した瞬間に閉じるため、本文が大きいと gh 側が
+          # SIGPIPE で非ゼロ終了し、pipefail で「一致しているのに不一致」と判定されて
+          # 毎時コメントが増え続ける（実測で 64KiB 超から発生）。一旦ファイルに落とす。
+          gh issue view "$num" -R "$REPO" --json body,comments \
+            --jq '[.body] + [.comments[].body] | join("\n")' > /tmp/existing.txt
+          if grep -qF "$fp" /tmp/existing.txt; then
             echo "同じ内容のドリフトは Issue #$num に記録済み。追記しない。"
           else
             gh issue comment "$num" -R "$REPO" --body-file /tmp/issue.md

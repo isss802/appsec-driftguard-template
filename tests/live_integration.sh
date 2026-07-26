@@ -41,10 +41,15 @@ run_detect() {  # 引数: [--current DIR]
 echo "== baseline 構築 =="
 mkdir -p "$BASE"
 akamai terraform --section "$SECTION" export-appsec --tfworkpath "$BASE" "$CONFIG_NAME" >/dev/null 2>&1
-terraform fmt "$BASE/modules/security" >/dev/null 2>&1
+# 検知側は再 export に -recursive を掛けるので、baseline も同じ整形にしないと
+# root の .tf が未整形のまま残って恒久的な偽ドリフトになる
+terraform fmt -recursive "$BASE" >/dev/null 2>&1
+# オブジェクト一覧に加えて稼働版(_activation)も入れる。無いと detect は
+# clean 扱いせず exit 3 になり、以降のテストが全部 FAIL する
 python3 -c 'import sys, json; sys.path.insert(0, "lib"); import detect
-json.dump(detect.live_objlists(sys.argv[1], sys.argv[2]), open(sys.argv[3], "w"),
-          ensure_ascii=False, indent=2)' "$CONFIG_ID" "$SECTION" "$OBJS"
+objs = detect.live_objlists(sys.argv[1], sys.argv[2])
+objs[detect.ACTIVATION_KEY] = detect.live_activation(sys.argv[1], sys.argv[2])
+json.dump(objs, open(sys.argv[3], "w"), ensure_ascii=False, indent=2)' "$CONFIG_ID" "$SECTION" "$OBJS"
 # baseline 構築の成否を検証（空 baseline で偽 PASS を防ぐ）
 n=$(find "$BASE/modules/security" -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$n" -lt 1 ]; then echo "  FATAL: baseline が空（export 失敗）"; exit 1; fi
@@ -75,7 +80,7 @@ if ! [[ "$RP_ID" =~ ^[0-9]+$ ]] || ! [[ "$CLONEV" =~ ^[0-9]+$ ]]; then echo "  F
   akamai appsec modify-rate-policy @/tmp/dg_rp_mod.json --section "$SECTION" --config "$CONFIG_ID" --rate-policy "$RP_ID" --version "$CLONEV" >/dev/null 2>&1
   cur=$(mktemp -d)
   akamai terraform --section "$SECTION" export-appsec --tfworkpath "$cur" "$CONFIG_NAME" >/dev/null 2>&1
-  terraform fmt "$cur/modules/security" >/dev/null 2>&1
+  terraform fmt -recursive "$cur" >/dev/null 2>&1
   out=$(run_detect --current "$cur"); code=$?
   if [ "$code" -eq 10 ] && echo "$out" | grep -q "export-diff"; then echo "  PASS (version-content 経路が発火)"; else echo "  FAIL (code=$code, version-content 未発火)"; fails=$((fails+1)); fi
   # 版削除（RP は版ごと消える）

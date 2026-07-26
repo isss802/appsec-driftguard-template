@@ -14,16 +14,19 @@ Akamai **App & API Protector**（AppSec / WAF）の Security Configuration を T
 
 ## 仕組み
 
-設定の現況を2つの見方で baseline と比べ、ドリフトの検知と、取り込みコードの生成を分担させます。
+設定の現況を3つの見方で baseline と比べ、ドリフトの検知と、取り込みコードの生成を分担させます。
 
 ```mermaid
 flowchart LR
   ACC[ACC で手動変更] --> CFG[Security Config]
-  CFG --> D1[① export の差分<br/>何が変わったかを検知]
-  CFG --> D2[② API 一覧の差分<br/>オブジェクト単位の実体]
+  ACT[古い版を activate し直す] --> CFG
+  CFG --> D1["① export の差分<br/>export root 全体<br/>（hostname を含む）"]
+  CFG --> D2["② 稼働版の差分<br/>staging / production の版番号"]
+  CFG --> D3["③ API 一覧の差分<br/>オブジェクト単位の実体"]
   D1 --> J{ドリフト?}
   D2 --> J
-  J -- あり --> ISSUE[Issue を作成<br/>差分 + 取り込み用 Terraform]
+  D3 --> J
+  J -- あり --> ISSUE[Issue を作成 or 既存 Issue に追記<br/>差分 + 取り込み用 Terraform]
   J -- なし --> NOOP[何もしない]
 ```
 
@@ -33,12 +36,29 @@ flowchart LR
 差分がそのまま「変わった箇所」になります。rate policy の値、ポリシーに割り当てた custom rule、
 WAF mode、そして ACC で新しく作られた定義も、ここに出ます。
 
-**② config レベルのオブジェクト一覧を比べる（API の差分）— 取り込みコードの材料**
+比べるのは **export root 全体**（`.tf` / `.tf.json` を再帰）です。`modules/security/` だけに絞ると、
+**保護対象ホストの一覧の増減を取りこぼします**。ホスト名の実値は root の `appsec-variables.tf` に
+しかなく、`modules/security/main.tf` は `host_names = var.hostnames` と参照しているだけなので、
+ホストを1本外しても `modules/security/` は変化しないためです。除外するのは `appsec-main.tf` だけで、
+provider ブロックに export した端末の `.edgerc` の絶対パスが入るためです（比較に含めると CI と
+手元で永久に食い違います）。
+
+**② 稼働版を比べる（staging / production に載っている版番号）**
+baseline を作った時点で staging / production に載っていた version 番号を `baseline/objects.json` に
+記録し、毎回それと突き合わせます。**ACC で何も編集せず、古い版を activate し直すだけ**の操作は、
+設定の中身が一切変わらないので ① にも ③ にも現れません。それでも実際に効いている保護は古い版の
+内容に戻ります。**設定の中身は baseline と一致したまま、防御だけが弱くなる**状態を拾うために、
+稼働版を独立した基準として持ちます。
+`baseline/objects.json` に稼働版の記録が無い（このテンプレートの以前の形式で作った）場合、検知は
+clean 扱いにせず**異常終了します**。「見ていないのに緑」を作らないためです。下の「既に baseline を
+運用している場合」を参照してください。
+
+**③ config レベルのオブジェクト一覧を比べる（API の差分）— 取り込みコードの材料**
 custom rules / rate policies の一覧を API で取得し、baseline と比べます。
 一覧 API は概要しか返さないので、各ルールを個別に取得して conditions まで突き合わせます。
 
-②は①の取りこぼしを埋めるためのものではありません（未割り当ての custom rule の追加・変更も、
-実測では①の差分に出ました）。②の役割は、差分を**オブジェクト単位で構造化して持つ**ことです。
+③は①の取りこぼしを埋めるためのものではありません（未割り当ての custom rule の追加・変更も、
+実測では①の差分に出ました）。③の役割は、差分を**オブジェクト単位で構造化して持つ**ことです。
 export の差分はテキストなので「custom rule が1つ増えた、id はこれ、中身はこれ」という形では
 取り出せません。API から実体を取っておくことで、Issue に載せる `resource` ブロックと
 `terraform import` コマンドを自動生成できます。
@@ -88,11 +108,11 @@ plan には現れません。だから検知は Terraform の外に置いてい�
 3. 検知の基準（baseline）を作って commit します。
 
    ```bash
-   # 版の内容（HCL）と、config レベルのオブジェクト一覧の2つを baseline に保存する
+   # 版の内容（HCL）と、config レベルのオブジェクト一覧＋稼働版を baseline に保存する
    mkdir -p ./baseline                               # export 先は先に作る（無いと失敗する）
    akamai terraform --section default export-appsec --tfworkpath ./baseline "<config 名>"
-   terraform fmt ./baseline/modules/security
-   python3 lib/make_baseline.py <config id>          # → baseline/objects.json
+   terraform fmt -recursive ./baseline               # 検知側と同じ整形（-recursive を外さない）
+   python3 lib/make_baseline.py <config id>          # → baseline/objects.json（稼働版も記録）
    git add -f baseline && git commit -m "add baseline"
    ```
 
@@ -114,15 +134,42 @@ plan には現れません。だから検知は Terraform の外に置いてい�
    （baseline を commit する前に定期実行が回ると、毎時赤くなるため）。
    4 が緑になったら `.github/workflows/drift-detect.yml` の `schedule:` のコメントを外してください。
 
+### 既に baseline を作って運用している場合（移行）
+
+検知は **export root 全体**を比べるようになり、**稼働版**も基準に加わりました。以前のバージョンで
+作った baseline のままだと、次の2つが起きます。
+
+- `baseline/objects.json` に稼働版の記録が無いため、検知が clean 扱いにせず**異常終了（赤）**します。
+- baseline の root にある `.tf`（`appsec-variables.tf` など）が未整形のままだと、内容が同じでも
+  差分として出ます。
+
+この順で移行してください。
+
+1. **先に、いま動いているバージョンのまま検知を1回実行し、緑（ドリフトなし）を確認します。**
+   未対応のドリフトが残ったまま先に進むと、それが新しい基準として取り込まれてしまいます。
+2. コードを更新します。
+3. baseline を整形し直し、オブジェクト一覧と稼働版を作り直します。**再 export はしません**
+   （再 export すると、いまの状態がそのまま新しい基準になり、内容のドリフトが消えます）。
+
+   ```bash
+   terraform fmt -recursive ./baseline
+   python3 lib/make_baseline.py <config id>      # objects.json を作り直す（稼働版を含む）
+   git add -f baseline && git commit -m "migrate baseline: recursive fmt + activation"
+   ```
+
+4. 検知を手動実行し、緑になることを確認します。ここで差分が出たなら、それは走査範囲が広がったことで
+   **新しく見えるようになったドリフト**です（保護対象ホストの増減など）。Issue の手順で片づけてから、
+   改めて baseline を更新してください。
+
 ---
 
 ## 含まれるもの
 
 | パス | 役割 |
 |---|---|
-| `lib/detect.py` | 検知の本体（2段の差分判定） |
+| `lib/detect.py` | 検知の本体（版の内容 / 稼働版 / オブジェクト一覧の3段の差分判定） |
 | `lib/adopt.py` | 検知結果を Issue 本文（差分＋取り込み用 Terraform）に変換 |
-| `lib/make_baseline.py` | baseline の `objects.json` を作るヘルパー |
+| `lib/make_baseline.py` | baseline の `objects.json`（オブジェクト一覧＋稼働版）を作るヘルパー |
 | `.github/workflows/drift-detect.yml` | 検知して Issue を立てるワークフロー |
 | `.github/workflows/apply.yml` | Terraform を反映するワークフロー（任意・下記参照） |
 | `terraform/drift-gate.tf` | 反映前に「稼働版が想定どおりか」を確認する例 |
@@ -165,8 +212,15 @@ rate policy の変更）。実行後に自身で後片付けしますが、書�
 - Akamai の version は、いちど有効化すると編集できません。変更は新しい version を作って行います。
   反映する version を `latest_version` に任せず明示するのが安全です（外部で作られた版まで拾わないため）。
 - 検知は cron 周期で走るので、変更から通知までにラグがあります。
-- **open な drift Issue が1件でも残っていると、次のドリフトは新しい Issue を作りません**
-  （毎時の重複を防ぐため）。対応が済んだら Issue を閉じてください。閉じ忘れると通知が止まります。
+- **open な drift Issue が1件でも残っていると、新しい Issue は作りません**（毎時の重複を防ぐため）。
+  ただし黙るわけではなく、**前と内容が変わったドリフトは既存の Issue にコメントで追記し、run にも
+  `::warning::` の注釈を出します**（同じ内容が続く間だけ静かにします）。対応中に別の変更が入っても
+  気づけるようにするためです。とはいえ通知の粒度は落ちるので、対応が済んだら Issue は閉じてください。
+- **設定の中身が baseline と一致していても、staging / production に載っている版が入れ替わっていれば
+  ドリフトとして検知します。** 古い版を activate し直すだけのロールバックは内容の差分に現れませんが、
+  実際に効いている保護は弱くなります。Issue には「稼働版が変わっています」として版番号が出ます。
+- **`baseline/objects.json` に稼働版の記録が無いと、検知は clean 扱いにせず異常終了します。**
+  以前の形式で作った baseline が該当します。下の「既に baseline を運用している場合」を参照してください。
 - private リポジトリにコピー後、**Actions を有効化**し、ワークフローが Issue を作れるよう
   権限（`issues: write`。Org で GITHUB_TOKEN を read-only に絞っている場合は要確認）を整えてください。
 

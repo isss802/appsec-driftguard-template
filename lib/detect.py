@@ -2,13 +2,19 @@
 """
 Akamai Security Config ドリフト検知の核。
 
-設計（実測に基づく二段検知）:
+設計（実測に基づく三段検知）:
   1) version-content diff : commit 済みの export(baseline) と、いま再 export した
      ものを fmt して突き合わせる。**検知の主役**。版に入っている変更（rate policy の
      フィールド、policy に割り当てられた custom rule とその action、WAF mode 等）に
      加え、ACC で新規に作られた config レベルの定義もここに出る。
      export は決定的（同一 config を2回 export すると fmt 後に完全一致）。
-  2) config-object diff   : config レベルのオブジェクト一覧（custom rules /
+     比較対象は export root 全体（hostname は root の appsec-variables.tf にしか
+     無いため。modules/security だけに絞ると保護対象ホストの増減を落とす）。
+  2) activation diff      : staging / production に載っている版番号を baseline に
+     記録して突き合わせる。「ACC で何も編集せず古い版を activate し直すだけ」の
+     ロールバックは、設定の中身が変わらないので 1) にも 3) にも出ない。中身は
+     baseline と一致したまま、実際に効いている保護だけが弱くなる状態を拾う。
+  3) config-object diff   : config レベルのオブジェクト一覧（custom rules /
      rate policies）を API から取り、baseline スナップショットと突き合わせる。
      **1) の取りこぼしを埋めるためではない**（未割り当て custom rule の追加・変更とも
      1) の export diff に出ることを実測で確認: 2026-07-27）。目的は差分をオブジェクト
@@ -28,6 +34,7 @@ Akamai Security Config ドリフト検知の核。
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -79,6 +86,18 @@ def load_export(root, subpath=DEFAULT_SUBPATH, exts=DEFAULT_EXTS,
                 with open(full, encoding="utf-8") as f:
                     out[rel] = _normalize_text(f.read())
     return out
+
+
+# provider ブロックに焼き込まれる端末依存の値。EXCLUDE_NAMES はファイル名で除外して
+# いるので、cli-terraform が将来 provider を別ファイル名に出すと除外が破れる。破れると
+# CI(/home/runner) と手元(/Users/...) で永久に食い違うが、diff にホームディレクトリが
+# 出るだけで原因が分かりにくい。静かに壊れないよう検出する。
+_ENV_DEPENDENT = re.compile(r'edgerc\s*=\s*"[^"]*"')
+
+
+def env_dependent_files(files):
+    """比較対象に端末依存の値が混ざっているファイル名を返す（空なら健全）。"""
+    return sorted(n for n, t in files.items() if _ENV_DEPENDENT.search(t))
 
 
 def diff_exports(baseline_files, current_files):
@@ -344,7 +363,7 @@ def main(argv=None):
 
     # fail-safe: baseline が空なら「clean」でなく異常。export パス/設定ミスを握り潰さない。
     if not baseline_files:
-        print(f"ERROR: baseline export が空（{args.baseline}/modules/security）。"
+        print(f"ERROR: baseline export が空（{args.baseline} 配下に .tf が無い）。"
               "パス・config 名・CLI を確認。", file=sys.stderr)
         return 3
     if not baseline_objs:
@@ -362,6 +381,13 @@ def main(argv=None):
         current_act = live_activation(args.config_id, args.section)
     except RuntimeError as e:
         print(f"ERROR: 現況取得に失敗（drift 判定を出さず中断）: {e}", file=sys.stderr)
+        return 3
+
+    # 除外が破れて端末依存の値が比較対象に入ったら、偽ドリフトを出す前に止める
+    bad = env_dependent_files(baseline_files) + env_dependent_files(current_files)
+    if bad:
+        print(f"ERROR: 比較対象に端末依存の値（.edgerc の絶対パス）を含むファイルがある: "
+              f"{sorted(set(bad))}。EXCLUDE_NAMES を見直してください。", file=sys.stderr)
         return 3
 
     report = classify(baseline_files, current_files, baseline_objs, current_objs,

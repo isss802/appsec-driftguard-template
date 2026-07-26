@@ -157,17 +157,20 @@ def _code(s):
 ISSUE_LIMIT = 60000  # GitHub Issue 本文上限(65536)への余裕
 
 
-def fingerprint(report):
-    """ドリフト内容の指紋。同一状態での通知の重複を避けつつ、
-    『内容が変わったのに通知されない窓』を作らないために使う。"""
-    payload = json.dumps(report, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+def body_fingerprint(body):
+    """Issue 本文そのものの指紋。
+
+    report 全体を hash すると、ドリフト判定では無視している揮発キー（version /
+    updateDate / used / ruleActivated 等）まで拾ってしまい、**表示内容が完全に
+    同一でも指紋が変わって重複コメントが出る**。判定したいのは「読み手にとって
+    同じ通知か」なので、本文に対して取る。"""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
-def fp_marker(report):
+def fp_marker(fp):
     """Issue 本文/コメントに埋める不可視マーカー。次回の実行が『この内容は既に
     通知済みか』を判定するための痕跡。"""
-    return f"<!-- dg-fp:{fingerprint(report)} -->"
+    return f"<!-- dg-fp:{fp} -->"
 
 
 def render_issue(report, config_name="", when="", config_id=None):

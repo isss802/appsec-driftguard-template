@@ -248,6 +248,15 @@ class TestLoadExport(unittest.TestCase):
         self.assertIn("appsec-variables.tf", files)
         self.assertIn(os.path.join(SEC, "a.tf"), files)
 
+    def test_no_machine_dependent_value_survives_exclusion(self):
+        """除外し損ねたファイルに端末依存の値が残っていないことを検出できる。
+        ファイル名ベースの除外は上流の出力が変わると破れるので、値そのものを見る。"""
+        d = self._mkexport({"providers.tf": 'provider "akamai" { edgerc = "/Users/x/.edgerc" }\n'})
+        files = detect.load_export(d)            # appsec-main.tf でないので除外されない
+        self.assertEqual(detect.env_dependent_files(files), ["providers.tf"])
+        clean = self._mkexport({"appsec.tf": "module x {}\n"})
+        self.assertEqual(detect.env_dependent_files(detect.load_export(clean)), [])
+
     def test_provider_file_is_excluded(self):
         """appsec-main.tf は export した端末の .edgerc 絶対パスを含むので比較対象外。
         含めると CI と手元で永久に食い違う。"""
