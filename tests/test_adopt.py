@@ -49,6 +49,21 @@ class TestResourceHcl(unittest.TestCase):
             self.assertNotIn(meta, hcl)
         self.assertIn("terraform import akamai_appsec_custom_rule.", imp)
         self.assertIn("1234", imp)
+        # config_id 未指定なら import はプレースホルダのまま
+        self.assertIn("<config_id>:1234", imp)
+
+    def test_import_fills_config_id(self):
+        # config_id を渡すと import に実 ID が埋まる（HCL 側は local.config_id 参照のまま）
+        hcl, imp = adopt.resource_hcl("custom_rules", RULE, config_id="12345")
+        self.assertIn("12345:1234", imp)
+        self.assertNotIn("<config_id>", imp)
+        self.assertIn("config_id   = local.config_id", hcl)   # HCL は DRY 参照を維持
+
+    def test_render_issue_threads_config_id(self):
+        # render_issue → adoption_items → resource_hcl まで config_id が通る
+        body = adopt.render_issue(_report(added_cr=RULE), config_id="12345")
+        self.assertIn("12345:1234", body)
+        self.assertNotIn("<config_id>:1234", body)
 
     def test_rate_policy_block(self):
         hcl, _ = adopt.resource_hcl("rate_policies", RATE)

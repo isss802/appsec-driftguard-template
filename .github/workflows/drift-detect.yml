@@ -115,7 +115,7 @@ jobs:
           import json, os, sys
           sys.path.insert(0, "lib"); import adopt
           rep = json.load(open("/tmp/report.json"))
-          print(adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", "")))
+          print(adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", ""), config_id=os.environ.get("CONFIG_ID")))
           PY
           gh label create drift -R "$REPO" --color FBCA04 --description "AppSec drift 検知" 2>/dev/null || true
           gh issue create -R "$REPO" --title "AppSec ドリフト検知" --label drift --body-file /tmp/issue.md

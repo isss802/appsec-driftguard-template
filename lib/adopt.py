@@ -59,9 +59,11 @@ _RESOURCE = {
 }
 
 
-def resource_hcl(typ, obj, config_id_ref="local.config_id"):
+def resource_hcl(typ, obj, config_id_ref="local.config_id", config_id=None):
     """1オブジェクト → resource ブロック HCL ＋ import コマンド（文字列2つ）。
-    未対応 type や中身が空の場合は HCL を出さず（"", 案内文）を返す。"""
+    未対応 type や中身が空の場合は HCL を出さず（"", 案内文）を返す。
+    config_id を渡すと import コマンドに実 ID を埋める（未指定なら <config_id> のまま）。
+    HCL 側は DRY のため常に config_id_ref（既定 local.config_id）を参照する。"""
     oid = obj.get("id", "x")
     if typ not in _RESOURCE:
         return "", f"# type '{typ}' は自動 HCL 化に未対応。手元の .tf で手動対応してください（id={oid}）。"
@@ -74,25 +76,27 @@ def resource_hcl(typ, obj, config_id_ref="local.config_id"):
            f'  config_id   = {config_id_ref}\n'
            f'  {attr} = jsonencode(\n{body}\n  )\n'
            f'}}')
-    imp = f'terraform import {res_type}.{local} <config_id>:{oid}'
+    cid = config_id if config_id not in (None, "") else "<config_id>"
+    imp = f'terraform import {res_type}.{local} {cid}:{oid}'
     return hcl, imp
 
 
-def adoption_items(report):
+def adoption_items(report, config_id=None):
     """report → 取り込み案内のリスト。各要素 {kind,typ,id,name,hcl,imports,note}。
-    名前など ACC 由来の文字列は生で持つ（Markdown 化は render 側で _code 無害化）。"""
+    名前など ACC 由来の文字列は生で持つ（Markdown 化は render 側で _code 無害化）。
+    config_id を渡すと import コマンドに実 ID を埋める。"""
     items = []
     for typ, d in (report.get("config_objects") or {}).items():
         cur = d.get("current", {})
         base = d.get("baseline", {})
         for i in d.get("added", []):
-            hcl, imp = resource_hcl(typ, cur.get(i, {"id": i}))
+            hcl, imp = resource_hcl(typ, cur.get(i, {"id": i}), config_id=config_id)
             items.append({"kind": "added", "typ": typ, "id": i,
                           "name": (cur.get(i) or {}).get("name", ""),
                           "hcl": hcl, "imports": [imp] if hcl else [imp] if imp else [],
                           "note": "ACC で新規に作られた定義。手元の .tf に貼り、既存を取り込むなら import する。"})
         for i in d.get("modified", []):
-            hcl, imp = resource_hcl(typ, cur.get(i, {"id": i}))
+            hcl, imp = resource_hcl(typ, cur.get(i, {"id": i}), config_id=config_id)
             items.append({"kind": "modified", "typ": typ, "id": i,
                           "name": (cur.get(i) or {}).get("name", ""),
                           "hcl": hcl, "imports": [] if hcl else ([imp] if imp else []),
@@ -128,8 +132,9 @@ def _code(s):
 ISSUE_LIMIT = 60000  # GitHub Issue 本文上限(65536)への余裕
 
 
-def render_issue(report, config_name="", when=""):
-    """Issue 本文（Markdown）。分かりやすい差分＋取り込み用サンプル Terraform。"""
+def render_issue(report, config_name="", when="", config_id=None):
+    """Issue 本文（Markdown）。分かりやすい差分＋取り込み用サンプル Terraform。
+    config_id を渡すと import コマンドに実 ID を埋める（未指定なら <config_id> のまま）。"""
     if not report.get("drift"):
         return "drift なし。"
     head = f" — {_code(config_name)}" if config_name else ""
@@ -149,7 +154,7 @@ def render_issue(report, config_name="", when=""):
                 L.append(f"- {ch['kind']}: {_code(ch['file'])}")
         L.append("")
 
-    items = adoption_items(report)
+    items = adoption_items(report, config_id=config_id)
     if items:
         L += ["### 取り込み用のサンプル Terraform", ""]
         for it in items:
