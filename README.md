@@ -89,6 +89,7 @@ plan には現れません。だから検知は Terraform の外に置いてい�
 
    ```bash
    # 版の内容（HCL）と、config レベルのオブジェクト一覧の2つを baseline に保存する
+   mkdir -p ./baseline                               # export 先は先に作る（無いと失敗する）
    akamai terraform --section default export-appsec --tfworkpath ./baseline "<config 名>"
    terraform fmt ./baseline/modules/security
    python3 lib/make_baseline.py <config id>          # → baseline/objects.json
