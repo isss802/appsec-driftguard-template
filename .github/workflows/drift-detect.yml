@@ -6,6 +6,10 @@ name: appsec-drift-detect
 # detect.py の exit: 0=clean / 10=drift / それ以外=異常（緑にせず赤で落とす）。
 
 on:
+  # 【最終運用形】スケジュール実行。ただしテンプレのままだと baseline 未commit で毎回失敗する。
+  # instantiate 後に baseline を commit してから、下記のコメントを外して有効化すること。
+  # schedule:
+  #   - cron: "17 * * * *"
   workflow_dispatch: {}
 
 permissions:
