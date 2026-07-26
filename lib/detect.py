@@ -4,12 +4,16 @@ Akamai Security Config ドリフト検知の核。
 
 設計（実測に基づく二段検知）:
   1) version-content diff : commit 済みの export(baseline) と、いま再 export した
-     ものを fmt して突き合わせる。版に入っている変更（rate policy のフィールド、
-     policy に割り当てられた custom rule とその action、WAF mode 等）を拾う。
+     ものを fmt して突き合わせる。**検知の主役**。版に入っている変更（rate policy の
+     フィールド、policy に割り当てられた custom rule とその action、WAF mode 等）に
+     加え、ACC で新規に作られた config レベルの定義もここに出る。
      export は決定的（同一 config を2回 export すると fmt 後に完全一致）。
   2) config-object diff   : config レベルのオブジェクト一覧（custom rules /
      rate policies）を API から取り、baseline スナップショットと突き合わせる。
-     未割り当ての custom rule 定義は版 export に出ないため、ここで拾う。
+     **1) の取りこぼしを埋めるためではない**（未割り当て custom rule の追加・変更とも
+     1) の export diff に出ることを実測で確認: 2026-07-27）。目的は差分をオブジェクト
+     単位で構造化して持つこと。テキスト diff からは「どの id のオブジェクトがどう
+     変わったか」を機械的に取り出せず、adopt.py の HCL/import 生成ができないため。
 
 注意（実測で確認した設計の性質）:
   - custom rule の *action*（alert/deny）は定義でなく policy 側にあり、config-object
@@ -254,8 +258,15 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     baseline_files = load_export(args.baseline)
-    with open(args.baseline_objs, encoding="utf-8") as f:
-        baseline_objs = json.load(f)
+    # baseline が読めない/壊れている場合も「異常(3)」で返す。生のトレースバックで落ちると
+    # 「監視が壊れている」のか「設定ミス」なのかが運用者に伝わらないため。
+    try:
+        with open(args.baseline_objs, encoding="utf-8") as f:
+            baseline_objs = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: baseline のオブジェクト一覧を読めない（{args.baseline_objs}）: {e}。"
+              "baseline を commit しているか確認。", file=sys.stderr)
+        return 3
 
     # fail-safe: baseline が空なら「clean」でなく異常。export パス/設定ミスを握り潰さない。
     if not baseline_files:
