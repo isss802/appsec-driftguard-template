@@ -25,12 +25,18 @@ METADATA_KEYS = frozenset((
 
 
 def _tf_local_name(name, oid):
-    """任意の名前を Terraform のリソースローカル名に正規化（英小数字と _ のみ）。"""
-    base = re.sub(r"[^a-zA-Z0-9_]", "_", str(name or "")).strip("_").lower()
-    base = re.sub(r"_+", "_", base)
+    """任意の名前を Terraform のリソースローカル名に正規化（英小数字と _ のみ）。
+
+    name だけでなく oid にも同じ正規化を掛ける。実運用の oid は Akamai 採番の整数
+    だが、baseline の objects.json のキー経由でも来るため、生で連結すると HCL を
+    脱出しうる。防御は 1 行なので入れておく。"""
+    def _norm(s):
+        s = re.sub(r"[^a-zA-Z0-9_]", "_", str(s or "")).strip("_").lower()
+        return re.sub(r"_+", "_", s)
+    base = _norm(name)
     if not base or not re.match(r"[a-z_]", base):
         base = "r_" + base if base else "obj"
-    return f"{base}_{oid}"
+    return f"{base}_{_norm(oid)}"
 
 
 def _clean(obj):
@@ -42,13 +48,25 @@ def _clean(obj):
     return obj
 
 
+def _bf_escapes(m):
+    """JSON の \\b / \\f エスケープだけを \\u0008 / \\u000c に置き換える。
+    バックスラッシュの連なりが奇数のときだけ最後の1本がエスケープ導入子＝本物の
+    制御文字。偶数ならデータ中のリテラルなバックスラッシュ（例: 正規表現の \\b＝
+    単語境界）なので触らない。ここを素朴な文字列置換にすると `\\bexec\\b` のような
+    WAF ルールの正規表現を \\u0008 に化けさせて壊す。"""
+    slashes, ch = m.group(1), m.group(2)
+    if len(slashes) % 2 == 0:
+        return m.group(0)
+    return slashes[:-1] + ("\\u0008" if ch == "b" else "\\u000c") + ""
+
+
 def _jsonencode_body(obj):
     """jsonencode(...) の中身。JSON を HCL の式として使うが、HCL の補間シーケンス
     ${...} / %{...} を無効化する（WAF ルール値の `${jndi:...}`（Log4Shell 検知）等で
-    HCL がパースエラー/黙って評価するのを防ぐ）。HCL 非対応の \\b \\f も無害化。"""
+    HCL がパースエラー/黙って評価するのを防ぐ）。HCL が解さない \\b \\f も無害化する。"""
     body = json.dumps(_clean(obj), ensure_ascii=False, indent=2, sort_keys=True)
     body = body.replace("${", "$${").replace("%{", "%%{")
-    body = body.replace("\\b", "\\u0008").replace("\\f", "\\u000c")
+    body = re.sub(r"(\\+)([bf])", _bf_escapes, body)
     # jsonencode( の中身を2スペース字下げして読みやすく
     return "\n".join("  " + ln if ln else ln for ln in body.splitlines())
 
@@ -78,6 +96,11 @@ def resource_hcl(typ, obj, config_id_ref="local.config_id", config_id=None):
            f'  {attr} = jsonencode(\n{body}\n  )\n'
            f'}}')
     cid = config_id if config_id not in (None, "") else "<config_id>"
+    # import には実 id が要るので正規化できない。安全なトークンでなければコマンドを
+    # 出さない（利用者はこれをそのままシェルに貼るため、改行や記号を通さない）。
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(oid)):
+        return hcl, (f"# id={_code(oid)} は想定外の形式。import コマンドは自動生成せず、"
+                     "値を確認して手で実行してください。")
     imp = f'terraform import {res_type}.{local} {cid}:{oid}'
     return hcl, imp
 

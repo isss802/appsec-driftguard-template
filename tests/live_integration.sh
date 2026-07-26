@@ -14,12 +14,20 @@ fails=0
 RID=""; CLONEV=""; RP_ID=""; RP_ORIG=""
 
 cleanup() {
-  # 何があっても注入物を消す
-  [ -n "$RID" ] && akamai appsec delete-custom-rule --section "$SECTION" --config "$CONFIG_ID" --custom-rule "$RID" >/dev/null 2>&1
+  # 何があっても注入物を消す。失敗は握り潰さない——気づかないと実 config に
+  # テスト用ルールや clone 版が residue として残り、以後ずっと drift として通知される。
+  if [ -n "$RID" ]; then
+    akamai appsec delete-custom-rule --section "$SECTION" --config "$CONFIG_ID" --custom-rule "$RID" >/dev/null 2>&1 \
+      || echo "  !! 後片付け失敗: custom rule $RID が残っています。手で削除してください"
+  fi
   if [ -n "$CLONEV" ]; then
     # 変更した rate policy を戻す（版が消える前に）／版を削除
-    [ -n "$RP_ID" ] && [ -n "$RP_ORIG" ] && akamai appsec modify-rate-policy "@$RP_ORIG" --section "$SECTION" --config "$CONFIG_ID" --rate-policy "$RP_ID" --version "$CLONEV" >/dev/null 2>&1
-    akamai appsec delete-config-version --section "$SECTION" --config "$CONFIG_ID" --version "$CLONEV" >/dev/null 2>&1
+    if [ -n "$RP_ID" ] && [ -n "$RP_ORIG" ]; then
+      akamai appsec modify-rate-policy "@$RP_ORIG" --section "$SECTION" --config "$CONFIG_ID" --rate-policy "$RP_ID" --version "$CLONEV" >/dev/null 2>&1 \
+        || echo "  !! 後片付け失敗: rate policy $RP_ID を戻せませんでした（version $CLONEV）"
+    fi
+    akamai appsec delete-config-version --section "$SECTION" --config "$CONFIG_ID" --version "$CLONEV" >/dev/null 2>&1 \
+      || echo "  !! 後片付け失敗: version $CLONEV が残っています。手で削除してください"
   fi
   rm -f /tmp/dg_it_rule.json /tmp/dg_rp_orig.json /tmp/dg_rp_mod.json 2>/dev/null
 }
@@ -31,10 +39,12 @@ run_detect() {  # 引数: [--current DIR]
 }
 
 echo "== baseline 構築 =="
+mkdir -p "$BASE"
 akamai terraform --section "$SECTION" export-appsec --tfworkpath "$BASE" "$CONFIG_NAME" >/dev/null 2>&1
 terraform fmt "$BASE/modules/security" >/dev/null 2>&1
-python3 -c "import sys;sys.path.insert(0,'lib');import detect,json;\
-json.dump(detect.live_objlists($CONFIG_ID,'$SECTION'),open('$OBJS','w'),ensure_ascii=False,indent=2)"
+python3 -c 'import sys, json; sys.path.insert(0, "lib"); import detect
+json.dump(detect.live_objlists(sys.argv[1], sys.argv[2]), open(sys.argv[3], "w"),
+          ensure_ascii=False, indent=2)' "$CONFIG_ID" "$SECTION" "$OBJS"
 # baseline 構築の成否を検証（空 baseline で偽 PASS を防ぐ）
 n=$(find "$BASE/modules/security" -name '*.tf' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$n" -lt 1 ]; then echo "  FATAL: baseline が空（export 失敗）"; exit 1; fi
@@ -54,9 +64,11 @@ fi
 
 echo "== T3: 版内容の変更（version-content 経路）→ exit 10 で検知 =="
 RP_ID=$(akamai appsec rate-policies --section "$SECTION" --config "$CONFIG_ID" --json 2>/dev/null | jq -r '.ratePolicies[0].id')
-LATEST=$(akamai appsec configs --section "$SECTION" --json 2>/dev/null | jq -r --arg n "$CONFIG_NAME" '.. | objects | select(.name?==$n) | .latestVersion')
+LATEST=$(akamai appsec configs --section "$SECTION" --json 2>/dev/null \
+  | jq -er --arg n "$CONFIG_NAME" 'first(.configurations[]? | select(.name==$n)) | .latestVersion // empty')
 CLONEV=$(akamai appsec clone --section "$SECTION" --config "$CONFIG_ID" --version "$LATEST" --json 2>/dev/null | jq -r '.version')
-if [ -z "$RP_ID" ] || [ -z "$CLONEV" ]; then echo "  FAIL (rate policy/clone 取得失敗＝path#1 未検証。無言SKIPにしない)"; fails=$((fails+1)); else
+# jq -r は null を "null" という文字列で出すので、空チェックだけではすり抜ける
+if ! [[ "$RP_ID" =~ ^[0-9]+$ ]] || ! [[ "$CLONEV" =~ ^[0-9]+$ ]]; then echo "  FAIL (rate policy/clone 取得失敗＝path#1 未検証。無言SKIPにしない)"; fails=$((fails+1)); else
   akamai appsec rate-policy --section "$SECTION" --config "$CONFIG_ID" --rate-policy "$RP_ID" --version "$CLONEV" --json 2>/dev/null > /tmp/dg_rp_orig.json
   RP_ORIG=/tmp/dg_rp_orig.json
   jq '.averageThreshold = (.averageThreshold + 1000)' /tmp/dg_rp_orig.json > /tmp/dg_rp_mod.json

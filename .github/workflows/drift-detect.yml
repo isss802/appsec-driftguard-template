@@ -23,14 +23,15 @@ concurrency:
 jobs:
   detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 20          # 詰まった run を放置しない（既定 6 時間）
     env:
       CONFIG_NAME: ${{ vars.APPSEC_CONFIG_NAME }}
       CONFIG_ID: ${{ vars.APPSEC_CONFIG_ID }}
       AKAMAI_SECTION: default
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"                   # cli-appsec が要求する Node（cli.json: 22.0.0）
 
@@ -67,10 +68,14 @@ jobs:
           git clone --depth 1 --branch "$APPSEC_PLUGIN_VER" \
             https://github.com/akamai/cli-appsec "$SRC/cli-appsec"
           ( cd "$SRC/cli-appsec" && npm ci --omit=dev )
-          akamai terraform --version
-          akamai appsec --version
+          # タグは可変参照なので、実際に入った版が指定どおりか確かめる（黙って別版で
+          # 動くと export 出力が baseline とズレて偽ドリフトになる）
+          akamai terraform --version | grep -q "$TF_PLUGIN_VER" \
+            || { echo "::error::cli-terraform の版が $TF_PLUGIN_VER と一致しない"; exit 1; }
+          akamai appsec --version | grep -q "$APPSEC_PLUGIN_VER" \
+            || { echo "::error::cli-appsec の版が $APPSEC_PLUGIN_VER と一致しない"; exit 1; }
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.15.8"
 

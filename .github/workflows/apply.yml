@@ -11,10 +11,11 @@ name: appsec-apply
 
 # 安全のため当面は手動起動のみ。terraform 構成一式・Environments（staging/production の
 # 承認者）・akamai CLI 導入を整え、本番反映の決裁が済んでから push トリガを有効化する。
-#   on:
-#     push:
-#       branches: [main]
+# 有効化するときは、下の push: 3 行のコメントを外す（on: ブロックの内側にあるので
+# そのまま外して正しい YAML になる）。
 on:
+  # push:
+  #   branches: [main]
   workflow_dispatch:
     inputs:
       target_staging_version:
@@ -64,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Akamai CLI
         env:
           EDGERC: ${{ secrets.EDGERC }}
@@ -72,7 +73,7 @@ jobs:
           set -euo pipefail
           umask 077
           printf '%s' "$EDGERC" > "$HOME/.edgerc"
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.15.8"
       - name: terraform apply (staging)
@@ -95,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production        # ← required reviewers を付ける（人間承認ゲート）
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Akamai CLI
         env:
           EDGERC: ${{ secrets.EDGERC }}
@@ -103,7 +104,7 @@ jobs:
           set -euo pipefail
           umask 077
           printf '%s' "$EDGERC" > "$HOME/.edgerc"
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.15.8"
       - name: terraform plan (production, gate + save plan)

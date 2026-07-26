@@ -1,0 +1,9 @@
+# Actions をコミット SHA で固定しているため、更新は dependabot に任せる。
+# SHA 固定は「タグが付け替えられても実行されるコードが変わらない」ための措置だが、
+# 固定したまま放置すると runner 側のランタイム廃止でいつか一斉に壊れる。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

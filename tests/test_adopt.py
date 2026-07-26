@@ -208,6 +208,45 @@ class TestAdversarialContent(unittest.TestCase):
         items = adopt.adoption_items(rep)
         self.assertEqual(items[0]["hcl"], "")
 
+    def test_literal_backslash_b_survives(self):
+        """正規表現の \\b(単語境界)を \\u0008(バックスペース)に化けさせない。
+
+        WAF ルールの正規表現で \\b は頻出する。素朴な文字列置換だと、JSON の
+        \\b エスケープと『リテラルのバックスラッシュ + b』を区別できず、
+        取り込み用コードが本番のルールを静かに壊す。terraform で評価した値が
+        元データと一致することは別途実機で確認済み。"""
+        rule = dict(RULE, conditions=[{"type": "requestHeaderMatch",
+                                       "value": [r"\bexec\b", r"C:\bin\file"]}])
+        hcl, _ = adopt.resource_hcl("custom_rules", rule)
+        self.assertIn(r"\\bexec\\b", hcl)        # HCL 上は \\b ＝ 評価すると \b
+        self.assertIn(r"C:\\bin\\file", hcl)
+        self.assertNotIn("u0008", hcl)
+        self.assertNotIn("u000c", hcl)
+
+    def test_real_control_chars_are_escaped(self):
+        """本物の U+0008 / U+000C は HCL が解さないので \\uXXXX にする。"""
+        rule = dict(RULE, conditions=[{"type": "x", "value": ["a\bb", "a\fc"]}])
+        hcl, _ = adopt.resource_hcl("custom_rules", rule)
+        self.assertIn(r"a\u0008b", hcl)
+        self.assertIn(r"a\u000cc", hcl)
+
+    def test_oid_is_sanitized_in_local_name(self):
+        """id 側も正規化する。name だけ正規化していると、id 経由で HCL を脱出できる。
+
+        実運用では id は Akamai 採番の整数なので到達しないが、baseline の
+        objects.json のキーからも来るため、防御は 1 行で済む。"""
+        evil = 'x" {}\n  provisioner "local-exec" { command = "id" }\n  x = "'
+        local = adopt._tf_local_name("n", evil)
+        self.assertNotIn('"', local)
+        self.assertNotIn("\n", local)
+        self.assertNotIn(" ", local)
+        rule = {"id": evil, "name": "n", "conditions": [{"type": "x", "value": ["1"]}]}
+        hcl, imp = adopt.resource_hcl("custom_rules", rule)
+        # 脱出コードは識別子の一部として無害化されるだけで、ブロックにはならない
+        self.assertNotIn('provisioner "', hcl)
+        self.assertEqual(hcl.count('resource "'), 1)
+        self.assertEqual(len(imp.splitlines()), 1)    # import も 1 行のまま
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
