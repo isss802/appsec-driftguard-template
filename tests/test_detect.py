@@ -213,12 +213,15 @@ class TestRenderReport(unittest.TestCase):
         detect.render_report(r)  # 例外が出ないこと
 
 
+SEC = os.path.join("modules", "security")
+
+
 class TestLoadExport(unittest.TestCase):
     def _mkexport(self, files):
+        """export root からの相対パスでファイルを置く。"""
         d = tempfile.mkdtemp(prefix="dg_")
-        sec = os.path.join(d, "modules", "security")
         for rel, content in files.items():
-            p = os.path.join(sec, rel)
+            p = os.path.join(d, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "w") as f:
                 f.write(content)
@@ -226,13 +229,33 @@ class TestLoadExport(unittest.TestCase):
 
     def test_reads_tf_and_tf_json_recursively(self):
         # FN-1: .tf.json とサブディレクトリも読む
-        d = self._mkexport({"a.tf": "A\n", "rules.tf.json": '{"x":1}\n',
-                            os.path.join("sub", "deep.tf"): "D\n", "notes.txt": "ignore\n"})
+        d = self._mkexport({os.path.join(SEC, "a.tf"): "A\n",
+                            os.path.join(SEC, "rules.tf.json"): '{"x":1}\n',
+                            os.path.join(SEC, "sub", "deep.tf"): "D\n",
+                            os.path.join(SEC, "notes.txt"): "ignore\n"})
         files = detect.load_export(d)
-        self.assertIn("a.tf", files)
-        self.assertIn("rules.tf.json", files)
-        self.assertIn(os.path.join("sub", "deep.tf"), files)
-        self.assertNotIn("notes.txt", files)
+        self.assertIn(os.path.join(SEC, "a.tf"), files)
+        self.assertIn(os.path.join(SEC, "rules.tf.json"), files)
+        self.assertIn(os.path.join(SEC, "sub", "deep.tf"), files)
+        self.assertNotIn(os.path.join(SEC, "notes.txt"), files)
+
+    def test_root_level_files_are_scanned(self):
+        """root の appsec-variables.tf も見る。hostname はここにしかないので、
+        modules/security だけに絞ると『保護対象ホストが1本消えた』を取りこぼす。"""
+        d = self._mkexport({"appsec-variables.tf": 'variable "hostnames" {}\n',
+                            os.path.join(SEC, "a.tf"): "A\n"})
+        files = detect.load_export(d)
+        self.assertIn("appsec-variables.tf", files)
+        self.assertIn(os.path.join(SEC, "a.tf"), files)
+
+    def test_provider_file_is_excluded(self):
+        """appsec-main.tf は export した端末の .edgerc 絶対パスを含むので比較対象外。
+        含めると CI と手元で永久に食い違う。"""
+        d = self._mkexport({"appsec-main.tf": 'provider "akamai" { edgerc = "/Users/x/.edgerc" }\n',
+                            "appsec.tf": "module x {}\n"})
+        files = detect.load_export(d)
+        self.assertNotIn("appsec-main.tf", files)
+        self.assertIn("appsec.tf", files)
 
     def test_normalizes_trailing_newline(self):
         d = self._mkexport({"a.tf": "x = 1"})   # 末尾改行なし
@@ -240,6 +263,30 @@ class TestLoadExport(unittest.TestCase):
 
     def test_missing_dir_empty(self):
         self.assertEqual(detect.load_export("/nonexistent/xyz"), {})
+
+
+class TestActivationDiff(unittest.TestCase):
+    """稼働版の突き合わせ。ACC で何も編集せず古い版を activate し直すだけの
+    ロールバックは、export diff にもオブジェクト一覧の diff にも出ない。"""
+
+    def test_same_versions_no_drift(self):
+        a = {"staging": 12, "production": 9}
+        self.assertEqual(detect.diff_activation(a, dict(a)), [])
+
+    def test_rollback_is_detected(self):
+        r = detect.classify({}, {}, {}, {},
+                            {"staging": 12, "production": 9},
+                            {"staging": 12, "production": 3})
+        self.assertTrue(r["drift"])
+        self.assertEqual(r["activation"],
+                         [{"network": "production", "baseline": 9, "current": 3}])
+        self.assertIn("production", detect.render_report(r))
+
+    def test_missing_side_is_not_drift(self):
+        # 片方が無い（古い baseline 等）ときに偽の drift を出さない。
+        # 「baseline に稼働版が無い」ケースは main が exit 3 で弾く。
+        self.assertEqual(detect.diff_activation(None, {"staging": 1}), [])
+        self.assertEqual(detect.diff_activation({"staging": 1}, None), [])
 
 
 class TestLiveFailSafe(unittest.TestCase):
@@ -271,24 +318,32 @@ class TestMain(unittest.TestCase):
         with open(os.path.join(sec, "a.tf"), "w") as f:
             f.write(content)
         oj = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        json.dump(objs if objs is not None else {"custom_rules": {}, "rate_policies": {}}, oj)
+        base_objs = objs if objs is not None else {"custom_rules": {}, "rate_policies": {}}
+        base_objs = dict(base_objs)
+        base_objs.setdefault(detect.ACTIVATION_KEY, {"staging": 12, "production": 9})
+        json.dump(base_objs, oj)
         oj.close()
         return d, oj.name
 
-    def _run(self, args, objs_return=None, objs_raise=None, export_raise=None):
-        orig_lo, orig_re = detect.live_objlists, detect.run_export
+    def _run(self, args, objs_return=None, objs_raise=None, export_raise=None,
+             act_return=None):
+        orig_lo, orig_re, orig_la = (detect.live_objlists, detect.run_export,
+                                     detect.live_activation)
         if objs_raise:
             detect.live_objlists = lambda c, s: (_ for _ in ()).throw(RuntimeError("boom"))
         else:
             detect.live_objlists = lambda c, s: (objs_return
                                                  if objs_return is not None
                                                  else {"custom_rules": {}, "rate_policies": {}})
+        detect.live_activation = lambda c, s: (act_return if act_return is not None
+                                               else {"staging": 12, "production": 9})
         if export_raise:
             detect.run_export = lambda *a: (_ for _ in ()).throw(RuntimeError("export failed"))
         try:
             return detect.main(args)
         finally:
-            detect.live_objlists, detect.run_export = orig_lo, orig_re
+            (detect.live_objlists, detect.run_export,
+             detect.live_activation) = orig_lo, orig_re, orig_la
 
     def test_clean_returns_0(self):
         d, oj = self._baseline()
@@ -311,6 +366,25 @@ class TestMain(unittest.TestCase):
                           "--config-name", "x", "--config-id", "1", "--current", d],
                          objs_return={"custom_rules": {}, "rate_policies": {}})
         self.assertEqual(code, 10)   # drift = 10
+
+
+    def test_rollback_only_returns_10(self):
+        """設定の中身は baseline と同じでも、稼働版が戻されていたら drift。
+        これを拾えないと『古い版を activate し直すだけ』の弱体化を見逃す。"""
+        d, oj = self._baseline()
+        code = self._run(["--baseline", d, "--baseline-objs", oj,
+                          "--config-name", "x", "--config-id", "1", "--current", d],
+                         act_return={"staging": 12, "production": 3})
+        self.assertEqual(code, 10)
+
+    def test_baseline_without_activation_returns_3(self):
+        """稼働版を持たない古い形式の baseline は clean 扱いにせず異常で止める。"""
+        d, _ = self._baseline()
+        oj = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump({"custom_rules": {}, "rate_policies": {}}, oj); oj.close()
+        code = self._run(["--baseline", d, "--baseline-objs", oj.name,
+                          "--config-name", "x", "--config-id", "1", "--current", d])
+        self.assertEqual(code, 3)
 
     def test_empty_baseline_files_returns_3(self):
         empty = tempfile.mkdtemp(prefix="dg_empty_")

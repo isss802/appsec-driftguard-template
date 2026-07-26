@@ -33,8 +33,18 @@ import sys
 import tempfile
 import difflib
 
-DEFAULT_SUBPATH = ("modules", "security")
+# export root 全体を見る。modules/security だけに絞ると、hostname（保護対象ホストの
+# 一覧）が root の appsec-variables.tf にしかないため、「Security Config から
+# ホストを1本外す＝そのサイトが WAF 保護から外れる」という最も見逃したくない変更を
+# 取りこぼす（実測で確認）。
+DEFAULT_SUBPATH = ()
 DEFAULT_EXTS = (".tf", ".tf.json")
+# provider ブロックに export した端末の .edgerc 絶対パスが焼き込まれるため比較対象外。
+# 含めると CI(/home/runner) と手元(/Users/...) で永久に食い違う。実 export を走査して
+# 端末依存の値を持つのはこのファイルだけであることを確認済み。
+EXCLUDE_NAMES = frozenset(("appsec-main.tf",))
+# baseline/objects.json 内で稼働版を格納するキー（オブジェクト一覧と同じ辞書に同居）
+ACTIVATION_KEY = "_activation"
 # 指紋から落とす揮発/読み取り専用キー（version/日時/link/作成者/状態）。全階層に再帰適用。
 # トップレベルの "id" は辞書キーと重複するため別途トップだけ除外（ネストした
 # id 参照は content なので残す）。status/used/ruleActivated は「割り当て状態」など
@@ -51,15 +61,18 @@ def _normalize_text(s):
     return s.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
 
 
-def load_export(root, subpath=DEFAULT_SUBPATH, exts=DEFAULT_EXTS):
-    """export ルート配下（既定 modules/security）を再帰で読み、
-    .tf / .tf.json を {相対パス: 正規化テキスト} で返す。"""
-    base = os.path.join(root, *subpath)
+def load_export(root, subpath=DEFAULT_SUBPATH, exts=DEFAULT_EXTS,
+                exclude=EXCLUDE_NAMES):
+    """export ルート配下を再帰で読み、.tf / .tf.json を
+    {相対パス: 正規化テキスト} で返す。端末依存のファイルは除外する。"""
+    base = os.path.join(root, *subpath) if subpath else root
     out = {}
     if not os.path.isdir(base):
         return out
     for dirpath, _dirs, files in os.walk(base):
         for name in sorted(files):
+            if name in exclude:
+                continue
             if name.endswith(exts):
                 full = os.path.join(dirpath, name)
                 rel = os.path.relpath(full, base)
@@ -135,14 +148,33 @@ def diff_objlists(baseline_objs, current_objs):
     return result
 
 
-def classify(baseline_files, current_files, baseline_objs, current_objs):
+def diff_activation(baseline_act, current_act):
+    """staging / production に載っている版番号の差分。
+
+    これを見ないと「ACC で何も編集せず、古い版を activate し直すだけ」の
+    ロールバックを取りこぼす。export は latest 版を書き出すので、稼働版だけが
+    戻された場合は export diff にもオブジェクト一覧の diff にも一切出ない。"""
+    if not baseline_act or not current_act:
+        return []
+    out = []
+    for net in ("staging", "production"):
+        b, c = baseline_act.get(net), current_act.get(net)
+        if b != c:
+            out.append({"network": net, "baseline": b, "current": c})
+    return out
+
+
+def classify(baseline_files, current_files, baseline_objs, current_objs,
+             baseline_act=None, current_act=None):
     """全判定の核。drift の有無と内訳を返す純関数。"""
     content = diff_exports(baseline_files, current_files)
     objects = diff_objlists(baseline_objs, current_objs)
+    activation = diff_activation(baseline_act, current_act)
     return {
-        "drift": bool(content) or bool(objects),
+        "drift": bool(content) or bool(objects) or bool(activation),
         "version_content": content,
         "config_objects": objects,
+        "activation": activation,
     }
 
 
@@ -165,6 +197,12 @@ def render_report(report):
                     lines.append(f"        {d}")
             else:
                 lines.append(f"    {ch['kind']}: {ch['file']}")
+    act = report.get("activation") or []
+    if act:
+        lines.append("  稼働版（staging / production に載っている版）:")
+        for a in act:
+            lines.append(f"    ~ {a['network']}: {a['baseline']} -> {a['current']}"
+                         "（Terraform を通さない activate／ロールバックの可能性）")
     co = report["config_objects"]
     if co:
         lines.append("  config レベルのオブジェクト（API 一覧 diff）:")
@@ -191,7 +229,9 @@ def run_export(dest, config_name, section):
     if r.returncode != 0:
         raise RuntimeError(f"export 失敗: {r.stderr[:400]}")
     # fmt 失敗を握り潰すと未整形の current が整形済み baseline と食い違い偽ドリフトになる
-    f = sh(["terraform", "fmt", os.path.join(dest, *DEFAULT_SUBPATH)])
+    # root と modules/* の両方を整形する必要があるので再帰で。baseline も同じ形で
+    # 作らないと未整形 vs 整形済みの食い違いで偽ドリフトになる。
+    f = sh(["terraform", "fmt", "-recursive", dest])
     if f.returncode != 0:
         raise RuntimeError(f"terraform fmt 失敗（偽ドリフト回避のため中断）: {f.stderr[:300]}")
 
@@ -218,6 +258,32 @@ def _appsec_json(section, config_id, *args, _tries=3):
         if attempt + 1 < _tries:
             _sleep(2 ** attempt)   # 1s, 2s
     raise RuntimeError(f"{' '.join(args)} 取得失敗（空扱いにせず中断）: {last}")
+
+
+def _appsec_configs(section, _tries=3):
+    """akamai appsec configs --json（--config を取らない）。失敗は例外。"""
+    last = ""
+    for attempt in range(_tries):
+        r = sh(["akamai", "appsec", "configs", "--section", section, "--json"])
+        if r.returncode == 0:
+            try:
+                return json.loads(r.stdout)
+            except Exception as e:
+                raise RuntimeError(f"configs の JSON parse 失敗: {e}")
+        last = r.stderr[:300]
+        if attempt + 1 < _tries:
+            _sleep(2 ** attempt)
+    raise RuntimeError(f"configs 取得失敗（空扱いにせず中断）: {last}")
+
+
+def live_activation(config_id, section):
+    """staging / production に「今」載っている版番号を返す。取得失敗は例外。"""
+    data = _appsec_configs(section)
+    for c in (data.get("configurations") or []):
+        if str(c.get("id")) == str(config_id):
+            return {"staging": c.get("stagingVersion"),
+                    "production": c.get("productionVersion")}
+    raise RuntimeError(f"config id={config_id} が configs 一覧に無い（id と権限を確認）")
 
 
 def live_objlists(config_id, section):
@@ -267,6 +333,14 @@ def main(argv=None):
         print(f"ERROR: baseline のオブジェクト一覧を読めない（{args.baseline_objs}）: {e}。"
               "baseline を commit しているか確認。", file=sys.stderr)
         return 3
+    # 稼働版はオブジェクト一覧と同じファイルに同居させる（_activation キー）。
+    # 無い＝古い形式の baseline。clean 扱いにするとロールバックを見逃すので異常にする。
+    baseline_act = baseline_objs.pop(ACTIVATION_KEY, None)
+    if not baseline_act:
+        print(f"ERROR: baseline に稼働版（{ACTIVATION_KEY}）が無い。"
+              "lib/make_baseline.py で baseline/objects.json を作り直してください。",
+              file=sys.stderr)
+        return 3
 
     # fail-safe: baseline が空なら「clean」でなく異常。export パス/設定ミスを握り潰さない。
     if not baseline_files:
@@ -285,11 +359,13 @@ def main(argv=None):
             run_export(tmp, args.config_name, args.section)
             current_files = load_export(tmp)
         current_objs = live_objlists(args.config_id, args.section)
+        current_act = live_activation(args.config_id, args.section)
     except RuntimeError as e:
         print(f"ERROR: 現況取得に失敗（drift 判定を出さず中断）: {e}", file=sys.stderr)
         return 3
 
-    report = classify(baseline_files, current_files, baseline_objs, current_objs)
+    report = classify(baseline_files, current_files, baseline_objs, current_objs,
+                      baseline_act, current_act)
     print(render_report(report))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:

@@ -14,6 +14,7 @@
 
 生成する HCL は terraform validate を通る形（テストで実証）。
 """
+import hashlib
 import json
 import re
 
@@ -156,6 +157,19 @@ def _code(s):
 ISSUE_LIMIT = 60000  # GitHub Issue 本文上限(65536)への余裕
 
 
+def fingerprint(report):
+    """ドリフト内容の指紋。同一状態での通知の重複を避けつつ、
+    『内容が変わったのに通知されない窓』を作らないために使う。"""
+    payload = json.dumps(report, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def fp_marker(report):
+    """Issue 本文/コメントに埋める不可視マーカー。次回の実行が『この内容は既に
+    通知済みか』を判定するための痕跡。"""
+    return f"<!-- dg-fp:{fingerprint(report)} -->"
+
+
 def render_issue(report, config_name="", when="", config_id=None):
     """Issue 本文（Markdown）。分かりやすい差分＋取り込み用サンプル Terraform。
     config_id を渡すと import コマンドに実 ID を埋める（未指定なら <config_id> のまま）。"""
@@ -167,6 +181,15 @@ def render_issue(report, config_name="", when="", config_id=None):
          "採用するなら下のサンプルを手元の `.tf` に取り込んでください。", ""]
     if when:
         L.append(f"検知時刻: {_code(when)}\n")
+
+    act = report.get("activation") or []
+    if act:
+        L += ["### 稼働版が変わっています", ""]
+        for a in act:
+            L.append(f"- **{a['network']}**: {a['baseline']} → {a['current']}")
+        L += ["", "Terraform を通さずに activate された可能性があります。**古い版へ戻されている場合、"
+              "設定の中身は baseline と一致したままでも、実際に効いている保護は弱くなっています。**"
+              "どの版が載るべきかを確認してください。", ""]
 
     vc = report.get("version_content") or []
     if vc:

@@ -21,11 +21,16 @@ def main(argv):
     config_id = argv[1]
     section = argv[2] if len(argv) > 2 else "default"
     objs = detect.live_objlists(config_id, section)   # 取得失敗時は例外で中断
+    # 稼働版（staging / production に今載っている版）も記録する。これが無いと
+    # 「古い版を activate し直すだけ」のロールバックを検知できない。
+    objs[detect.ACTIVATION_KEY] = detect.live_activation(config_id, section)
     os.makedirs("baseline", exist_ok=True)
     with open("baseline/objects.json", "w", encoding="utf-8") as f:
         json.dump(objs, f, ensure_ascii=False, indent=2)
+    act = objs[detect.ACTIVATION_KEY]
     print("wrote baseline/objects.json "
-          f"(custom_rules={len(objs['custom_rules'])}, rate_policies={len(objs['rate_policies'])})")
+          f"(custom_rules={len(objs['custom_rules'])}, rate_policies={len(objs['rate_policies'])}, "
+          f"staging={act['staging']}, production={act['production']})")
     return 0
 
 

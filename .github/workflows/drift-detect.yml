@@ -103,24 +103,37 @@ jobs:
         if: steps.detect.outputs.code == '0'
         run: echo "drift なし。何もしない。"
 
-      - name: Open drift Issue
+      - name: Notify drift (Issue 作成、既に open なら内容が変わったときだけ追記)
         if: steps.detect.outputs.code == '10'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # 既に open な drift Issue があればスキップ（毎時の重複を防ぐ）
-          count="$(gh issue list -R "$REPO" --state open --label drift --json number --jq 'length' 2>/dev/null || echo 0)"
-          if [ "${count:-0}" -gt 0 ]; then
-            echo "既存の open な drift Issue があるためスキップ。"; exit 0
-          fi
-          # 差分＋取り込み用 Terraform を Issue 本文に生成（config 名は env 経由＝インジェクション回避）
+          # 差分＋取り込み用 Terraform を本文に生成（config 名は env 経由＝インジェクション回避）。
+          # 末尾に内容の指紋をコメントとして埋め、次回が「既に通知済みか」を判定できるようにする。
           python3 - > /tmp/issue.md <<'PY'
           import json, os, sys
           sys.path.insert(0, "lib"); import adopt
           rep = json.load(open("/tmp/report.json"))
           print(adopt.render_issue(rep, config_name=os.environ.get("CONFIG_NAME", ""), config_id=os.environ.get("CONFIG_ID")))
+          print()
+          print(adopt.fp_marker(rep))
           PY
-          gh label create drift -R "$REPO" --color FBCA04 --description "AppSec drift 検知" 2>/dev/null || true
-          gh issue create -R "$REPO" --title "AppSec ドリフト検知" --label drift --body-file /tmp/issue.md
+          fp="$(python3 -c 'import json,sys; sys.path.insert(0,"lib"); import adopt; print(adopt.fingerprint(json.load(open("/tmp/report.json"))))')"
+          num="$(gh issue list -R "$REPO" --state open --label drift --json number --jq '.[0].number // empty')"
+          if [ -z "$num" ]; then
+            gh label create drift -R "$REPO" --color FBCA04 --description "AppSec drift 検知" 2>/dev/null || true
+            gh issue create -R "$REPO" --title "AppSec ドリフト検知" --label drift --body-file /tmp/issue.md
+            exit 0
+          fi
+          # open な Issue がある。重複 Issue は作らないが、黙って何もしないと
+          # 「対応中に入った別の変更」が通知されない窓ができる。しかもその窓は、
+          # 無害なドリフトを1つ起こすだけで意図的に開けられる。内容が変われば追記する。
+          if gh issue view "$num" -R "$REPO" --json body,comments \
+               --jq '[.body] + [.comments[].body] | join("\n")' | grep -qF "$fp"; then
+            echo "同じ内容のドリフトは Issue #$num に記録済み。追記しない。"
+          else
+            gh issue comment "$num" -R "$REPO" --body-file /tmp/issue.md
+            echo "::warning::別のドリフトを検知しました。open な Issue #$num があるため新規作成せず、コメントで追記しています。"
+          fi
