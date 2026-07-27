@@ -73,8 +73,12 @@ plan には現れません。だから検知は Terraform の外に置いてい�
 ドリフトを検知すると、次の内容の Issue が自動で立ちます。
 
 - 何がどう変わったかの差分
-- それを手元の Terraform に取り込むためのサンプル `resource` ブロック（`jsonencode` 込み）
-- 新規オブジェクトを Terraform の管理下に入れる `terraform import` コマンド
+- staging / production に載っている版が入れ替わっていれば、その版番号
+- 取り込み用のサンプル `resource` ブロック（`jsonencode` 込み）と `terraform import` コマンド
+
+3つ目が出るのは **custom rule と rate policy の追加・変更のとき**だけです。WAF mode や
+security policy、match target、advanced settings の変更は、差分としては出ますが取り込み用の
+コードは付きません（該当する resource を手元の `.tf` で直してください）。
 
 読んだ人が、採用するならサンプルを `.tf` に反映して `terraform apply`、
 不要なら ACC 側を元に戻します。落ち着いたら baseline を更新して Issue を閉じます。
@@ -87,21 +91,55 @@ plan には現れません。だから検知は Terraform の外に置いてい�
   （検知ワークフローは CI 内で自動導入します。**CLI 本体・プラグイン・Terraform はすべて版を固定**しています。
   プラグインを `akamai install`（＝常に最新）任せにすると export 出力が変わって baseline と食い違い、
   偽ドリフトを招くため。版は `drift-detect.yml` の `CLI_VER` / `TF_PLUGIN_VER` / `APPSEC_PLUGIN_VER` で管理します）
-- **Terraform**（`terraform fmt` / 反映で使用）
+- **Terraform**（`terraform fmt -recursive` / 反映で使用。baseline と検知で同じ整形を掛けるため、
+  手元と CI で同じ版を使ってください）
 - **Python 3**
 - **`.edgerc`** に `[default]` セクション（このテンプレートは section=`default` を前提。
   別名にする場合はワークフローと baseline 作成コマンドの section を合わせてください）
 
+## 始める前に（この2つは後から取り返しがつきません）
+
+### 1. リポジトリは必ず private に。Fork は使わない
+
+**Fork したリポジトリは、後から private に変更できません**（GitHub の仕様）。
+"Use this template" で **Private** を選ぶか、clone して自分の private リポジトリへ push してください。
+
+private が要る理由は、ドリフト Issue に WAF ルールが載ることだけではありません。
+**より大きいのは baseline の commit のほう**です。下のクイックスタート 3 で commit するのは、
+
+- 全 custom rule の conditions（＝WAF の検知ロジックそのもの）
+- match target / WAF mode / rate policy の閾値 / penalty box / bot 設定 一式
+- **保護対象ホストの全リスト**
+- 通知先のメールアドレス
+- `appsec-main.tf` に焼き込まれた、export した端末の `.edgerc` の絶対パス
+
+です。しかも baseline の commit は**ワークフローが1回も走る前**に行うので、ワークフロー側で
+どんなガードを入れても間に合いません。可視性はここで決めてください。
+
+### 2. `.edgerc` は READ-ONLY のものを使う
+
+検知ワークフローが使うのは `export-appsec` と `appsec` の GET だけで、**書き込み権限は要りません**。
+ACC で **AppSec の READ-ONLY** グラントだけを持つ API クライアントを新しく作り、その資格情報を
+Secret に入れてください。事故が起きたときの被害が「WAF 設定を読まれる」で止まります。
+
+**`~/.edgerc` を丸ごと貼らないでください。** 多くの人の `~/.edgerc` には papi 用や別アカウント用の
+セクションが同居していて、貼るとそれも全部 runner に載ります。Secret に入れるのは、CI 用に作った
+資格情報の `[default]` セクション**だけ**にしてください。
+
+書き込み権限が要るのは `apply.yml`（反映）と `tests/live_integration.sh`（結合テスト）だけです。
+これらを使うなら、検知用とは**別の**資格情報を用意し、Environment シークレットに分けるのが安全です。
+
+---
+
 ## クイックスタート
 
-1. このリポジトリを、**自分の private なリポジトリ**にコピーします。
-   （ドリフト Issue には設定の中身が載るため、運用リポジトリは private にしてください。）
+1. このリポジトリを、**自分の private なリポジトリ**にコピーします（上の「始める前に」を参照）。
 
 2. GitHub のリポジトリ設定で次を登録します。
 
    | 種別 | 名前 | 内容 |
    |---|---|---|
-   | Secret | `EDGERC` | Akamai の `.edgerc`（API 認証情報） |
+   | Secret | `EDGERC` | CI 用に作った READ-ONLY 資格情報の `.edgerc`（`[default]` セクションのみ） |
    | Variable | `APPSEC_CONFIG_NAME` | 対象 Security Config の名前 |
    | Variable | `APPSEC_CONFIG_ID` | 対象 Security Config の ID |
 
@@ -124,6 +162,16 @@ plan には現れません。だから検知は Terraform の外に置いてい�
 
    `baseline/` は `.gitignore` 済みです（実データを誤って公開しないため）。
    自分の private リポジトリで運用するときだけ、`-f` を付けて意図的に commit します。
+   **後で baseline を更新するときも、毎回 `-f` が要ります。** `.gitignore` 済みなので、
+   `-f` 無しだと**新しく現れたファイルが黙って無視されます**（`git status` にも出ません）。
+   プラグインを上げて生成ファイルが1本増えたときなどに、baseline にだけそれが無い状態になり、
+   永久にドリフトが出続けます。
+
+   **`baseline/` は検知の基準であって、運用する Terraform 構成ではありません。** ここで
+   `terraform init` / `apply` を始めないでください。次に baseline を作り直したときに上書き
+   されます。反映用の `.tf` は別のディレクトリで管理してください（`contract_id` / `group_name`
+   を手入力する必要があるのもそちら側で、baseline では空のままで構いません）。
+
    **baseline を作らずにワークフローを回すと、検知は clean 扱いせず異常終了（赤）します**
    （設定ミスを見逃さないための挙動）。必ず先に baseline を commit してください。
 
@@ -198,20 +246,31 @@ CONFIG_NAME="<config 名>" CONFIG_ID="<config id>" bash tests/live_integration.s
 ```
 
 このテストは**実際の config に書き込みます**（一時的な custom rule の作成、version の clone、
-rate policy の変更）。実行後に自身で後片付けしますが、書き込み権限のある `.edgerc` と
-`jq` が必要です。本番の config では実行しないでください。
+rate policy の変更）。実行後に自身で後片付けしますが、**書き込み権限のある `.edgerc`**（＝検知用の
+READ-ONLY とは別のもの）と `jq` が必要です。**本番の config では実行しないでください。**
+また、後片付けはローカルには及びません。`tests/live_baseline/` に実 config の完全な export が
+残るので、実行後に消してください（`.gitignore` 済みなので commit はされません）。
 
 ---
 
 ## 知っておくべきこと
 
-- **ドリフト Issue には設定の中身（WAF ルール等）が載ります。** 運用リポジトリは必ず private に。
-  この公開テンプレートには実データを含めていません（`baseline/` は `.gitignore` 済み）。
+- **ドリフト Issue にも baseline にも設定の中身（WAF ルール・保護対象ホスト等）が入ります。**
+  運用リポジトリは必ず private に（上の「始める前に」を参照）。この公開テンプレートには実データを
+  含めていません（`baseline/` は `.gitignore` 済み）。
 - ACC 側で新しく作られたオブジェクトは、`terraform plan` には現れません（state に無いため）。
   その分は Issue にサンプルコードと `import` コマンドを添えます。
 - Akamai の version は、いちど有効化すると編集できません。変更は新しい version を作って行います。
   反映する version を `latest_version` に任せず明示するのが安全です（外部で作られた版まで拾わないため）。
 - 検知は cron 周期で走るので、変更から通知までにラグがあります。
+- **ワークフローが失敗（赤）したときの通知を設定してください。** 認証情報の失効、config 名の変更、
+  baseline の不整合はいずれも異常終了（exit 3）で、**Issue は立ちません**。GitHub の cron 失敗通知は
+  既定だとワークフローを最後に更新した人にしか飛ばないので、放置すると「毎時走っているから安心」と
+  思ったまま監視が死にます。ドリフトそのものより、監視が止まることのほうが危険です。
+- **cron の頻度は config の規模に合わせてください。** 1 回の実行で CLI とプラグインの導入 ＋ config
+  全体の再 export が走ります。さらに custom rule は**1本ずつ個別に API 取得**するので、ルールが
+  100 本あれば毎時 100 回以上のリクエストになります。private リポジトリの Actions は課金対象でも
+  あるので、ルール数の多い config では日次に落とすことも検討してください。
 - **open な drift Issue が1件でも残っていると、新しい Issue は作りません**（毎時の重複を防ぐため）。
   ただし黙るわけではなく、**前と内容が変わったドリフトは既存の Issue にコメントで追記し、run にも
   `::warning::` の注釈を出します**（同じ内容が続く間だけ静かにします）。対応中に別の変更が入っても
@@ -220,7 +279,11 @@ rate policy の変更）。実行後に自身で後片付けしますが、書�
   ドリフトとして検知します。** 古い版を activate し直すだけのロールバックは内容の差分に現れませんが、
   実際に効いている保護は弱くなります。Issue には「稼働版が変わっています」として版番号が出ます。
 - **`baseline/objects.json` に稼働版の記録が無いと、検知は clean 扱いにせず異常終了します。**
-  以前の形式で作った baseline が該当します。下の「既に baseline を運用している場合」を参照してください。
+  以前の形式で作った baseline が該当します。「既に baseline を作って運用している場合（移行）」を
+  参照してください。
+- **ドリフトが残ったまま Issue を閉じると、毎時新しい Issue が立ち続けます。** 重複の抑止は
+  「open な Issue があるか」で見ているためです。閉じるのは、ACC 側を戻すか baseline を更新して
+  ドリフトが解消してからにしてください。
 - private リポジトリにコピー後、**Actions を有効化**し、ワークフローが Issue を作れるよう
   権限（`issues: write`。Org で GITHUB_TOKEN を read-only に絞っている場合は要確認）を整えてください。
 
@@ -231,4 +294,4 @@ rate policy の変更）。実行後に自身で後片付けしますが、書�
 - 検知の頻度: `.github/workflows/drift-detect.yml` の `schedule` のコメントを外し、cron を変更。
   （配布時点ではコメントアウトしてあります。クイックスタート 5 を参照。）
 - 対象 config: `APPSEC_CONFIG_NAME` / `APPSEC_CONFIG_ID`（Variable）。
-- 認証: `EDGERC`（Secret）。最小権限のクレデンシャルを推奨します。
+- 認証: `EDGERC`（Secret）。検知は READ-ONLY で足ります（上の「始める前に」を参照）。
